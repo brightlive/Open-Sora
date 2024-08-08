@@ -18,7 +18,7 @@ model = dict(
     from_pretrained="hpcai-tech/OpenSora-STDiT-v3",
     qk_norm=True,
     enable_flash_attn=True,
-    enable_layernorm_kernel=True,
+    enable_layernorm_kernel=False,
 )
 vae = dict(
     type="OpenSoraVAE_V1_2",

@@ -1,0 +1,23 @@
+build:
+  gpu: true
+  python_version: "3.9"
+  python_packages:
+    - torch==2.2.2
+    - torchvision==0.17.2
+    - xformers==0.0.25.post1
+    - colossalai>=0.4.0
+    - mmengine>=0.10.3
+    - pandas>=2.0.3
+    - timm==0.9.16
+    - rotary_embedding_torch==0.5.3
+    - ftfy>=6.2.0 # for t5
+    - diffusers==0.27.2 # for vae
+    - accelerate==0.29.2 # for t5
+    - av>=12.0.0 # for video loading
+    - numpy<2.0.0
+  run:
+    - pip install flash-attn --no-build-isolation
+    - git clone https://github.com/brightlive/Open-Sora /open-sora-install # Clone the repo solely for the purpose of installing requirements
+    - pip install -v /open-sora-install
+
+predict: "/src/predict.py:Predictor"

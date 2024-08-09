@@ -19,5 +19,6 @@ build:
     - pip install flash-attn --no-build-isolation
     - git clone https://github.com/brightlive/Open-Sora /open-sora-install # Clone the repo solely for the purpose of installing requirements
     - pip install -v /open-sora-install
+    - pip install "pydantic<2.0.0"
 
 predict: "/src/predict.py:Predictor"

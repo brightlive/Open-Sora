@@ -3,6 +3,8 @@ import time
 from pprint import pformat
 from cog import BasePredictor, Input, Path
 import sys
+import subprocess
+import tempfile
 
 import colossalai
 import torch
@@ -35,14 +37,61 @@ from opensora.utils.inference_utils import (
 )
 from opensora.utils.misc import all_exists, create_logger, is_distributed, is_main_process, to_torch_dtype
 
+def repeat_frames(video_path, save_path, r):
+    if r < 1:
+        raise ValueError("Repeat factor 'r' must be 1 or greater.")
 
+    # Check if the output path is the same as the input path
+    if video_path == save_path:
+        tmp_save_path = save_path + ".tmp.mp4"
+    else:
+        tmp_save_path = save_path
+
+    # Construct the ffmpeg command
+    command = [
+        'ffmpeg',
+        '-i', video_path,                         # Input video
+        '-vf', f"tblend=all_mode=average,framestep={r},minterpolate='mi_mode=dup:fps=1*{r}'", # Frame repetition filter
+        '-c:a', 'copy',  # Copy audio as is
+        tmp_save_path,  # Output video path
+    ]
+
+    # Execute the command
+    subprocess.run(command, check=True)
+
+    # If a temporary file was used, overwrite the original file
+    if video_path == save_path:
+        subprocess.run(['mv', tmp_save_path, save_path], check=True)
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
         pass
     def predict(
         self,
-        config: str = "/src/configs/opensora-v1-2/inference"
+        config: str = "/src/configs/opensora-v1-2/inference",
+        prompt: str = None,
+        width: int = 512,
+        height: int = 512,
+        steps: int = Input(
+            description="Number of inference steps",
+            ge=1,
+            le=100,
+            default=25,
+        ),
+        guidance_scale: float = Input(
+            description="Guidance Scale. How closely do we want to adhere to the prompt and its contents",
+            ge=0.0,
+            le=20,
+            default=7.5,
+        ),
+        fps: int = Input(default=8, ge=1, le=60),
+        fps_output: int = Input(default=24, ge=1, le=60),
+        video_length: int = Input(
+            description="Length of the video in frames (playback is at 8 fps e.g. 16 frames @ 8 fps is 2 seconds)",
+            default=24,
+            ge=1,
+            le=1024,
+        ),
     ) -> Path:
         print("Here we are in predict")
         torch.set_grad_enabled(False)
@@ -53,6 +102,14 @@ class Predictor(BasePredictor):
         if len(sys.argv) == 1:  # No arguments passed
             sys.argv.append("/src/configs/opensora-v1-2/inference/sample.py")
         cfg = parse_configs(training=False)
+
+
+        cfg.image_size = (height, width)
+        cfg.steps = steps
+        cfg.cfg_scale = guidance_scale
+
+        repeat_factor = fps_output / fps
+
 
         # == device and dtype ==
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -89,7 +146,9 @@ class Predictor(BasePredictor):
         vae = build_module(cfg.vae, MODELS).to(device, dtype).eval()
 
         # == prepare video size ==
+        
         image_size = cfg.get("image_size", None)
+        #image_size = (width, height)
         if image_size is None:
             resolution = cfg.get("resolution", None)
             aspect_ratio = cfg.get("aspect_ratio", None)
@@ -97,7 +156,8 @@ class Predictor(BasePredictor):
                 resolution is not None and aspect_ratio is not None
             ), "resolution and aspect_ratio must be provided if image_size is not provided"
             image_size = get_image_size(resolution, aspect_ratio)
-        num_frames = get_num_frames(cfg.num_frames)
+        #num_frames = get_num_frames(cfg.num_frames)
+        num_frames = video_length
 
         # == build diffusion model ==
         input_size = (num_frames, *image_size)
@@ -125,6 +185,8 @@ class Predictor(BasePredictor):
         # ======================================================
         # == load prompts ==
         prompts = cfg.get("prompt", None)
+        if prompt != None:
+            prompts = [prompt]
         start_idx = cfg.get("start_index", 0)
         if prompts is None:
             if cfg.get("prompt_path", None) is not None:
@@ -139,8 +201,9 @@ class Predictor(BasePredictor):
         assert len(mask_strategy) == len(prompts), "Length of mask_strategy must be the same as prompts"
 
         # == prepare arguments ==
-        fps = cfg.fps
-        save_fps = cfg.get("save_fps", fps // cfg.get("frame_interval", 1))
+        #fps = cfg.fps
+        save_fps = fps
+        #save_fps = cfg.get("save_fps", fps // cfg.get("frame_interval", 1))
         multi_resolution = cfg.get("multi_resolution", None)
         batch_size = cfg.get("batch_size", 1)
         num_sample = cfg.get("num_sample", 1)
@@ -307,6 +370,11 @@ class Predictor(BasePredictor):
                         if save_path.endswith(".mp4") and cfg.get("watermark", False):
                             time.sleep(1)  # prevent loading previous generated video
                             add_watermark(save_path)
+                        
+                        if repeat_factor > 1:
+                            time.sleep(1)  # prevent loading previous generated video
+                            repeat_frames(save_path, save_path, repeat_factor)
+
             start_idx += len(batch_prompts)
         logger.info("Inference finished.")
         logger.info("Saved %s samples to %s", start_idx, save_dir)

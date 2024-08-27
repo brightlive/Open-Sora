@@ -87,7 +87,16 @@ def get_image_dimensions(image_path):
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        pass
+        # == init distributed env ==
+        if is_distributed():
+            colossalai.launch_from_torch({})
+            coordinator = DistCoordinator()
+            enable_sequence_parallelism = coordinator.world_size > 1
+            if enable_sequence_parallelism:
+                set_sequence_parallel_group(dist.group.WORLD)
+        else:
+            coordinator = None
+            enable_sequence_parallelism = False
     def predict(
         self,
         config: str = "/src/configs/opensora-v1-2/inference",
@@ -180,15 +189,7 @@ class Predictor(BasePredictor):
         torch.backends.cudnn.allow_tf32 = True
 
         # == init distributed env ==
-        if is_distributed():
-            colossalai.launch_from_torch({})
-            coordinator = DistCoordinator()
-            enable_sequence_parallelism = coordinator.world_size > 1
-            if enable_sequence_parallelism:
-                set_sequence_parallel_group(dist.group.WORLD)
-        else:
-            coordinator = None
-            enable_sequence_parallelism = False
+        # now in setup
         
         #set_random_seed(seed=cfg.get("seed", 1024))
         if seed == -1:

@@ -15,6 +15,8 @@ build:
     - accelerate==0.29.2 # for t5
     - av>=12.0.0 # for video loading
     - numpy<2.0.0
+    - google-cloud-storage
+    - pillow
   run:
     - pip install flash-attn --no-build-isolation
     - git clone https://github.com/brightlive/Open-Sora /open-sora-install # Clone the repo solely for the purpose of installing requirements

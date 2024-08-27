@@ -7,7 +7,7 @@ save_fps = 24
 prompt = ["A cool cucumber"]
 
 save_dir = "./samples/samples/"
-seed = 42
+#seed = 1785
 batch_size = 1
 multi_resolution = "STDiT2"
 dtype = "bf16"
@@ -39,5 +39,5 @@ scheduler = dict(
     cfg_scale=7.0,
 )
 
-aes = 6.5
-flow = None
+aes = 10.0 # Was 6.5
+flow = 0.25 # Was None

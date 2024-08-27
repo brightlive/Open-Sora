@@ -12,6 +12,9 @@ import torch.distributed as dist
 from colossalai.cluster import DistCoordinator
 from mmengine.runner import set_random_seed
 from tqdm import tqdm
+from google.cloud import storage
+from PIL import Image
+import random
 
 from opensora.acceleration.parallel_states import set_sequence_parallel_group
 from opensora.datasets import save_sample
@@ -37,7 +40,21 @@ from opensora.utils.inference_utils import (
 )
 from opensora.utils.misc import all_exists, create_logger, is_distributed, is_main_process, to_torch_dtype
 
-def repeat_frames(video_path, save_path, r):
+def download_public_file(bucket_name, source_blob_name, destination_file_name):
+
+    storage_client = storage.Client.create_anonymous_client()
+
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(source_blob_name)
+    blob.download_to_filename(destination_file_name)
+
+    print(
+        "Downloaded public blob {} from bucket {} to {}.".format(
+            source_blob_name, bucket.name, destination_file_name
+        )
+    )
+
+def repeat_frames(video_path, save_path, r, target_width, target_height):
     if r < 1:
         raise ValueError("Repeat factor 'r' must be 1 or greater.")
 
@@ -51,7 +68,7 @@ def repeat_frames(video_path, save_path, r):
     command = [
         'ffmpeg',
         '-i', video_path,                         # Input video
-        '-vf', f"tblend=all_mode=average,framestep={r},minterpolate='mi_mode=dup:fps=1*{r}'", # Frame repetition filter
+        '-vf', f"minterpolate='fps=24',scale={target_width}:{target_height}", # Frame repetition filter
         '-c:a', 'copy',  # Copy audio as is
         tmp_save_path,  # Output video path
     ]
@@ -62,6 +79,11 @@ def repeat_frames(video_path, save_path, r):
     # If a temporary file was used, overwrite the original file
     if video_path == save_path:
         subprocess.run(['mv', tmp_save_path, save_path], check=True)
+
+def get_image_dimensions(image_path):
+    with Image.open(image_path) as img:
+        width, height = img.size
+    return width, height
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
@@ -92,6 +114,30 @@ class Predictor(BasePredictor):
             ge=1,
             le=1024,
         ),
+        referenceImg: str = Input(default=None),
+        bucket_name: str = Input(default="bright-live-ai.appspot.com"),
+        seed: int = Input(
+            description="Seed for different images and reproducibility. Use -1 to randomise seed",
+            default=-1,
+        ),
+        # Unused
+        controlnetStrength: float = Input(default=0.1, ge=0.0, le=1.0),
+        ipAdapterStrength: float = Input(default=0.5, ge=0.0, le=1.0),
+        face: bool = Input(default=False),
+        negative_prompt: str = Input(
+            default="",
+        ),
+        ai_upscale: int = Input(
+            description="AI Upscaler to use, if any. 0 for traditional upscaling, 1 for tile-upscale and 2 for refine",
+            default=0,
+            ge=0,
+            le=2,
+        ),
+        path: str = Input(
+            description="Choose the base model for animation generation. If 'CUSTOM' is selected, provide a custom model URL in the next parameter",
+            default="toonyou_beta3.safetensors",
+        ),
+
     ) -> Path:
         print("Here we are in predict")
         torch.set_grad_enabled(False)
@@ -103,13 +149,27 @@ class Predictor(BasePredictor):
             sys.argv.append("/src/configs/opensora-v1-2/inference/sample.py")
         cfg = parse_configs(training=False)
 
-
-        cfg.image_size = (height, width)
-        cfg.steps = steps
-        cfg.cfg_scale = guidance_scale
-
         repeat_factor = fps_output / fps
 
+        generate_height = height
+        generate_width = width
+
+        if referenceImg is not None and referenceImg != "":
+            img2video = True
+            if bucket_name is not None and bucket_name != "":
+                #os.system("mkdir input")
+                # os.system("cp brian512.png input/00000000.png") #temp
+                download_public_file(bucket_name, referenceImg, "input.png")
+                referenceImg = "input.png"
+            generate_width, generate_height = get_image_dimensions(referenceImg)
+        
+        
+        if generate_width > 1024 or generate_height > 1024 and False:
+            generate_height = generate_height * 0.5
+            generate_width = generate_width * 0.5
+        cfg.image_size = (int(generate_height), int(generate_width)) # These coordinates must be presented backwards
+        cfg.steps = steps
+        cfg.cfg_scale = guidance_scale
 
         # == device and dtype ==
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -129,7 +189,12 @@ class Predictor(BasePredictor):
         else:
             coordinator = None
             enable_sequence_parallelism = False
-        set_random_seed(seed=cfg.get("seed", 1024))
+        
+        #set_random_seed(seed=cfg.get("seed", 1024))
+        if seed == -1:
+            seed = random.randint(0, 2**32 - 1)
+        set_random_seed(seed=seed)
+        print(f"Using seed: {seed}")
 
         # == init logger ==
         logger = create_logger()
@@ -195,14 +260,27 @@ class Predictor(BasePredictor):
                 prompts = [cfg.get("prompt_generator", "")] * 1_000_000  # endless loop
 
         # == prepare reference ==
-        reference_path = cfg.get("reference_path", [""] * len(prompts))
-        mask_strategy = cfg.get("mask_strategy", [""] * len(prompts))
+        #reference_path = cfg.get("reference_path", [""] * len(prompts))
+        if referenceImg != None:
+            reference_path = [referenceImg]
+            mask_strategy = ["0"]
+        else:
+            reference_path = [""]
+            mask_strategy = [""]
+        #mask_strategy = cfg.get("mask_strategy", [""] * len(prompts))
+        
         assert len(reference_path) == len(prompts), "Length of reference must be the same as prompts"
         assert len(mask_strategy) == len(prompts), "Length of mask_strategy must be the same as prompts"
 
         # == prepare arguments ==
-        #fps = cfg.fps
-        save_fps = fps
+
+        # My old way
+        #save_fps = fps
+
+        # Trying this
+        save_fps = int(video_length / 24)
+
+
         #save_fps = cfg.get("save_fps", fps // cfg.get("frame_interval", 1))
         multi_resolution = cfg.get("multi_resolution", None)
         batch_size = cfg.get("batch_size", 1)
@@ -363,7 +441,7 @@ class Predictor(BasePredictor):
                         video = torch.cat(video, dim=1)
                         save_path = save_sample(
                             video,
-                            fps=save_fps,
+                            fps=fps,
                             save_path=save_path,
                             verbose=verbose >= 2,
                         )
@@ -371,9 +449,9 @@ class Predictor(BasePredictor):
                             time.sleep(1)  # prevent loading previous generated video
                             add_watermark(save_path)
                         
-                        if repeat_factor > 1:
+                        if repeat_factor > 1 or height > original_height:
                             time.sleep(1)  # prevent loading previous generated video
-                            repeat_frames(save_path, save_path, repeat_factor)
+                            repeat_frames(save_path, save_path, repeat_factor, width, height)
 
             start_idx += len(batch_prompts)
         logger.info("Inference finished.")

@@ -86,17 +86,60 @@ def get_image_dimensions(image_path):
     return width, height
 
 class Predictor(BasePredictor):
+    text_encoder = None
+    vae = None
     def setup(self) -> None:
+
+        # == init logger ==
+        self.logger = create_logger()
+        #self.logger.info("Inference configuration:\n %s", pformat(cfg.to_dict()))
+        verbose = 1
+        self.progress_wrap = tqdm if verbose == 1 else (lambda x: x)
+
+        # == device and dtype ==
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg_dtype = "bf16"
+        assert cfg_dtype in ["fp16", "bf16", "fp32"], f"Unknown mixed precision {cfg_dtype}"
+        self.dtype = to_torch_dtype("bf16")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
         # == init distributed env ==
         if is_distributed():
             colossalai.launch_from_torch({})
-            coordinator = DistCoordinator()
-            enable_sequence_parallelism = coordinator.world_size > 1
+            self.coordinator = DistCoordinator()
+            self.enable_sequence_parallelism = coordinator.world_size > 1
             if enable_sequence_parallelism:
                 set_sequence_parallel_group(dist.group.WORLD)
         else:
-            coordinator = None
-            enable_sequence_parallelism = False
+            self.coordinator = None
+            self.enable_sequence_parallelism = False
+
+        # ======================================================
+        # build model & load weights
+        # ======================================================
+        self.logger.info("Building models...")
+        # == build text-encoder and vae ==
+        if self.text_encoder == None:
+            print("Didn't find text encoder, loading it")
+            self.text_encoder = build_module(dict(
+                type="t5",
+                from_pretrained="models/t5",
+                model_max_length=300,
+            ), MODELS, device=self.device)
+        else:
+            print("Found pre-existing text encoder!")
+        if self.vae == None:
+            print("Didn't find vae, loading it")
+            self.vae = build_module(dict(
+                type="OpenSoraVAE_V1_2",
+                from_pretrained="hpcai-tech/OpenSora-VAE-v1.2",
+                micro_frame_size=17,
+                micro_batch_size=4,
+            ), MODELS).to(self.device, self.dtype).eval()
+        else:
+            print("Found pre-existing vae!")
+    
     def predict(
         self,
         config: str = "/src/configs/opensora-v1-2/inference",
@@ -114,6 +157,12 @@ class Predictor(BasePredictor):
             ge=0.0,
             le=20,
             default=7.5,
+        ),
+        flow: float = Input(
+            description="Flow. Strength of the motion",
+            ge=0.0,
+            le=20,
+            default=0.25,
         ),
         fps: int = Input(default=8, ge=1, le=60),
         fps_output: int = Input(default=24, ge=1, le=60),
@@ -181,12 +230,7 @@ class Predictor(BasePredictor):
         cfg.cfg_scale = guidance_scale
 
         # == device and dtype ==
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        cfg_dtype = cfg.get("dtype", "fp32")
-        assert cfg_dtype in ["fp16", "bf16", "fp32"], f"Unknown mixed precision {cfg_dtype}"
-        dtype = to_torch_dtype(cfg.get("dtype", "bf16"))
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # now in setup
 
         # == init distributed env ==
         # now in setup
@@ -198,18 +242,12 @@ class Predictor(BasePredictor):
         print(f"Using seed: {seed}")
 
         # == init logger ==
-        logger = create_logger()
-        logger.info("Inference configuration:\n %s", pformat(cfg.to_dict()))
-        verbose = cfg.get("verbose", 1)
-        progress_wrap = tqdm if verbose == 1 else (lambda x: x)
+        # Now in setup
 
         # ======================================================
         # build model & load weights
         # ======================================================
-        logger.info("Building models...")
-        # == build text-encoder and vae ==
-        text_encoder = build_module(cfg.text_encoder, MODELS, device=device)
-        vae = build_module(cfg.vae, MODELS).to(device, dtype).eval()
+        # Now in setup
 
         # == prepare video size ==
         
@@ -227,21 +265,21 @@ class Predictor(BasePredictor):
 
         # == build diffusion model ==
         input_size = (num_frames, *image_size)
-        latent_size = vae.get_latent_size(input_size)
+        latent_size = self.vae.get_latent_size(input_size)
         model = (
             build_module(
                 cfg.model,
                 MODELS,
                 input_size=latent_size,
-                in_channels=vae.out_channels,
-                caption_channels=text_encoder.output_dim,
-                model_max_length=text_encoder.model_max_length,
-                enable_sequence_parallelism=enable_sequence_parallelism,
+                in_channels=self.vae.out_channels,
+                caption_channels=self.text_encoder.output_dim,
+                model_max_length=self.text_encoder.model_max_length,
+                enable_sequence_parallelism=self.enable_sequence_parallelism,
             )
-            .to(device, dtype)
+            .to(self.device, self.dtype)
             .eval()
         )
-        text_encoder.y_embedder = model.y_embedder  # HACK: for classifier-free guidance
+        self.text_encoder.y_embedder = model.y_embedder  # HACK: for classifier-free guidance
 
         # == build scheduler ==
         scheduler = build_module(cfg.scheduler, SCHEDULERS)
@@ -297,7 +335,7 @@ class Predictor(BasePredictor):
         prompt_as_path = cfg.get("prompt_as_path", False)
 
         # == Iter over all samples ==
-        for i in progress_wrap(range(0, len(prompts), batch_size)):
+        for i in self.progress_wrap(range(0, len(prompts), batch_size)):
             # == prepare batch prompts ==
             batch_prompts = prompts[i : i + batch_size]
             ms = mask_strategy[i : i + batch_size]
@@ -308,11 +346,11 @@ class Predictor(BasePredictor):
             original_batch_prompts = batch_prompts
 
             # == get reference for condition ==
-            refs = collect_references_batch(refs, vae, image_size)
+            refs = collect_references_batch(refs, self.vae, image_size)
 
             # == multi-resolution info ==
             model_args = prepare_multi_resolution_info(
-                multi_resolution, len(batch_prompts), image_size, num_frames, fps, device, dtype
+                multi_resolution, len(batch_prompts), image_size, num_frames, fps, self.device, self.dtype
             )
 
             # == Iter over number of sampling for one prompt ==
@@ -351,13 +389,13 @@ class Predictor(BasePredictor):
                     # only call openai API when
                     # 1. seq parallel is not enabled
                     # 2. seq parallel is enabled and the process is rank 0
-                    if not enable_sequence_parallelism or (enable_sequence_parallelism and is_main_process()):
+                    if not self.enable_sequence_parallelism or (self.enable_sequence_parallelism and is_main_process()):
                         for idx, prompt_segment_list in enumerate(batched_prompt_segment_list):
                             batched_prompt_segment_list[idx] = refine_prompts_by_openai(prompt_segment_list)
 
                     # sync the prompt if using seq parallel
-                    if enable_sequence_parallelism:
-                        coordinator.block_all()
+                    if self.enable_sequence_parallelism:
+                        self.coordinator.block_all()
                         prompt_segment_length = [
                             len(prompt_segment_list) for prompt_segment_list in batched_prompt_segment_list
                         ]
@@ -388,7 +426,7 @@ class Predictor(BasePredictor):
                     batched_prompt_segment_list[idx] = append_score_to_prompts(
                         prompt_segment_list,
                         aes=cfg.get("aes", None),
-                        flow=cfg.get("flow", None),
+                        flow=flow,
                         camera_motion=cfg.get("camera_motion", None),
                     )
 
@@ -415,26 +453,26 @@ class Predictor(BasePredictor):
 
                     # == sampling ==
                     torch.manual_seed(1024)
-                    z = torch.randn(len(batch_prompts), vae.out_channels, *latent_size, device=device, dtype=dtype)
+                    z = torch.randn(len(batch_prompts), self.vae.out_channels, *latent_size, device=self.device, dtype=self.dtype)
                     masks = apply_mask_strategy(z, refs, ms, loop_i, align=align)
                     samples = scheduler.sample(
                         model,
-                        text_encoder,
+                        self.text_encoder,
                         z=z,
                         prompts=batch_prompts_loop,
-                        device=device,
+                        device=self.device,
                         additional_args=model_args,
-                        progress=verbose >= 2,
+                        progress=False,
                         mask=masks,
                     )
-                    samples = vae.decode(samples.to(dtype), num_frames=num_frames)
+                    samples = self.vae.decode(samples.to(self.dtype), num_frames=num_frames)
                     video_clips.append(samples)
 
                 # == save samples ==
                 if is_main_process():
                     for idx, batch_prompt in enumerate(batch_prompts):
-                        if verbose >= 2:
-                            logger.info("Prompt: %s", batch_prompt)
+                        if False:
+                            self.logger.info("Prompt: %s", batch_prompt)
                         save_path = save_paths[idx]
                         video = [video_clips[i][idx] for i in range(loop)]
                         for i in range(1, loop):
@@ -444,17 +482,17 @@ class Predictor(BasePredictor):
                             video,
                             fps=fps,
                             save_path=save_path,
-                            verbose=verbose >= 2,
+                            verbose=False,
                         )
                         if save_path.endswith(".mp4") and cfg.get("watermark", False):
                             time.sleep(1)  # prevent loading previous generated video
                             add_watermark(save_path)
                         
-                        if repeat_factor > 1 or height > original_height:
+                        if repeat_factor > 1 or height > generate_height:
                             time.sleep(1)  # prevent loading previous generated video
                             repeat_frames(save_path, save_path, repeat_factor, width, height)
 
             start_idx += len(batch_prompts)
-        logger.info("Inference finished.")
-        logger.info("Saved %s samples to %s", start_idx, save_dir)
+        self.logger.info("Inference finished.")
+        self.logger.info("Saved %s samples to %s", start_idx, save_dir)
         return Path('samples/samples/sample_0000.mp4')

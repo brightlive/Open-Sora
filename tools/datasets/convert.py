@@ -108,9 +108,12 @@ def process_general_images(root, output):
 def process_general_videos(root, output):
     root = os.path.expanduser(root)
     if not os.path.exists(root):
+        print("Returning because root path doesn't exist")
         return
     path_list = get_filelist(root, VID_EXTENSIONS)
+    print("Path list length is " + str(len(path_list)))
     path_list = list(set(path_list))  # remove duplicates
+    print("After removing duplicates path list length is " + str(len(path_list)))
     fname_list = [os.path.splitext(os.path.basename(x))[0] for x in path_list]
     relpath_list = [os.path.relpath(x, root) for x in path_list]
     df = pd.DataFrame(dict(path=path_list, id=fname_list, relpath=relpath_list))
@@ -138,6 +141,7 @@ if __name__ == "__main__":
     elif args.dataset == "image":
         process_general_images(args.root, args.output)
     elif args.dataset == "video":
+        print("Going to process videos")
         process_general_videos(args.root, args.output)
     else:
         raise ValueError("Invalid dataset")

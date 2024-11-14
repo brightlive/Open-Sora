@@ -152,12 +152,6 @@ class Predictor(BasePredictor):
             le=100,
             default=25,
         ),
-        guidance_scale: float = Input(
-            description="Guidance Scale. How closely do we want to adhere to the prompt and its contents",
-            ge=0.0,
-            le=20,
-            default=7.5,
-        ),
         flow: float = Input(
             description="Flow. Strength of the motion",
             ge=0.0,
@@ -178,7 +172,17 @@ class Predictor(BasePredictor):
             description="Seed for different images and reproducibility. Use -1 to randomise seed",
             default=-1,
         ),
+        guidance_scale: float = Input(
+            description="Guidance Scale. How closely do we want to adhere to the prompt and its contents",
+            ge=0.0,
+            le=20,
+            default=7.5,
+        ),
+        aes: float = Input(default=6.5, ge=0, le=20),
+        loop: int = Input(default=1, ge=0, le=10),
+        condition_frame_length: int = Input(default=5, ge=0, le=20),
         # Unused
+        condition_frame_edit: float = Input(default=0, ge=0, le=20),
         controlnetStrength: float = Input(default=0.1, ge=0.0, le=1.0),
         ipAdapterStrength: float = Input(default=0.5, ge=0.0, le=1.0),
         face: bool = Input(default=False),
@@ -219,14 +223,31 @@ class Predictor(BasePredictor):
                 # os.system("cp brian512.png input/00000000.png") #temp
                 download_public_file(bucket_name, referenceImg, "input.png")
                 referenceImg = "input.png"
-            generate_width, generate_height = get_image_dimensions(referenceImg)
-        
+            with Image.open(referenceImg) as img:
+                image_width, image_height = (img.size)
+                aspect_ratio = img.width / img.height
+                generate_width = 528
+                generate_height = 944
+                new_width = int(generate_height * aspect_ratio) 
+                resized_img = img.resize((new_width, generate_height), Image.BICUBIC)
+                left = (new_width - generate_width) // 2
+                right = left + generate_width
+                top = 0
+                bottom = generate_height
+                cropped_img = resized_img.crop((left, top, right, bottom))
+                cropped_img.save(referenceImg)
         
         if generate_width > 1024 or generate_height > 1024 and False:
             generate_height = generate_height * 0.5
             generate_width = generate_width * 0.5
         cfg.image_size = (int(generate_height), int(generate_width)) # These coordinates must be presented backwards
+        
         cfg.steps = steps
+        # Temp
+        # cfg.steps = 50
+
+        cfg.loop = loop
+        
         cfg.cfg_scale = guidance_scale
 
         # == device and dtype ==
@@ -325,8 +346,8 @@ class Predictor(BasePredictor):
         batch_size = cfg.get("batch_size", 1)
         num_sample = cfg.get("num_sample", 1)
         loop = cfg.get("loop", 1)
-        condition_frame_length = cfg.get("condition_frame_length", 5)
-        condition_frame_edit = cfg.get("condition_frame_edit", 0.0)
+        condition_frame_length = condition_frame_length
+        condition_frame_edit = condition_frame_edit
         align = cfg.get("align", None)
 
         save_dir = cfg.save_dir
@@ -425,7 +446,7 @@ class Predictor(BasePredictor):
                 for idx, prompt_segment_list in enumerate(batched_prompt_segment_list):
                     batched_prompt_segment_list[idx] = append_score_to_prompts(
                         prompt_segment_list,
-                        aes=cfg.get("aes", None),
+                        aes=aes,
                         flow=flow,
                         camera_motion=cfg.get("camera_motion", None),
                     )
@@ -448,7 +469,7 @@ class Predictor(BasePredictor):
                     # == add condition frames for loop ==
                     if loop_i > 0:
                         refs, ms = append_generated(
-                            vae, video_clips[-1], refs, ms, loop_i, condition_frame_length, condition_frame_edit
+                            self.vae, video_clips[-1], refs, ms, loop_i, condition_frame_length, condition_frame_edit
                         )
 
                     # == sampling ==
@@ -490,7 +511,7 @@ class Predictor(BasePredictor):
                         
                         if repeat_factor > 1 or height > generate_height:
                             time.sleep(1)  # prevent loading previous generated video
-                            repeat_frames(save_path, save_path, repeat_factor, width, height)
+                            repeat_frames(save_path, save_path, repeat_factor, width, height)  
 
             start_idx += len(batch_prompts)
         self.logger.info("Inference finished.")

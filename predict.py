@@ -236,7 +236,6 @@ class Predictor(BasePredictor):
                 bottom = generate_height
                 cropped_img = resized_img.crop((left, top, right, bottom))
                 cropped_img.save(referenceImg)
-        
         if generate_width > 1024 or generate_height > 1024 and False:
             generate_height = generate_height * 0.5
             generate_width = generate_width * 0.5
